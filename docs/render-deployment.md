@@ -8,7 +8,7 @@ The included Blueprint creates:
 
 - A Render Web Service named `aegisbank`
 - A Render Postgres database named `aegisbank-db`
-- Automatic Prisma migration execution before each deploy
+- Automatic Prisma migration execution during each build
 - Generated JWT secrets
 - A health check at `/api/v1/health`
 
@@ -41,13 +41,12 @@ git push origin main
 Render reads the following commands from `render.yaml`:
 
 ```text
-Build:       npm ci && npm run build
-Pre-deploy:  npx prisma migrate deploy
+Build:       npm ci && npx prisma migrate deploy && npm run build
 Start:       npm start
 Health:      /api/v1/health
 ```
 
-The migration runs before the web service starts. It creates the database tables using the committed migration at `prisma/migrations/0001_init/migration.sql`.
+Render Free does not support `preDeployCommand`. Prisma migrations therefore run as part of the build command, before the application build. They create the database tables using the committed migration at `prisma/migrations/0001_init/migration.sql`.
 
 ## Deploy manually instead
 
@@ -60,11 +59,12 @@ If you do not want to use the Blueprint:
 
 ```text
 Runtime:          Node
-Build Command:    npm ci && npm run build
-Pre-Deploy:       npx prisma migrate deploy
+Build Command:    npm ci && npx prisma migrate deploy && npm run build
 Start Command:    npm start
 Health Check:     /api/v1/health
 ```
+
+Render Free does not support `preDeployCommand`; use the build command above so Prisma migrations run during the build.
 
 ## Environment variables
 
