@@ -1,0 +1,32 @@
+# infrastructure/docker-compose.yml — local dev (Doc 3 Part F).
+# Spins up Postgres + the backend container so `docker compose up` runs the
+# full stack locally. Not executed in the Next.js sandbox (no Docker daemon);
+# provided as a reference artifact matching the spec.
+version: "3.9"
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: aegisbank
+      POSTGRES_PASSWORD: localdevpass
+      POSTGRES_DB: aegisbank
+    ports: ["5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aegisbank"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+  backend:
+    build: ../backend
+    env_file: ../backend/.env
+    environment:
+      DATABASE_URL: postgresql://aegisbank:localdevpass@postgres:5432/aegisbank
+      NODE_ENV: development
+      PORT: 3000
+    ports: ["3000:3000"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+volumes:
+  pgdata:

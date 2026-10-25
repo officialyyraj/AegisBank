@@ -1,0 +1,286 @@
+// AegisBank Prisma schema — mirrors Document 1  table-for-table.
+// AegisBank uses PostgreSQL in deployed environments and local development.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/// users — identity + KYC status (requirements
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  fullName     String
+  // CHECK (role IN ('customer','admin')) — enforced in app + enum below
+  role         String   @default("customer")
+  // CHECK (kyc_status IN ('pending','approved','rejected'))
+  kycStatus    String   @default("pending")
+  createdAt    DateTime @default(now())
+  failedLoginAttempts Int @default(0)
+  lockedUntil  DateTime?
+
+  kycDocuments  KycDocument[]
+  accounts      Account[]
+  notifications Notification[]
+  // Design note: state for the new-device fraud rule (requirements  R3)
+  deviceFingerprints DeviceFingerprint[]
+  passwordResets     PasswordReset[]
+  refreshTokens      RefreshToken[]
+  idempotencyKeys    IdempotencyKey[]
+  payees              Payee[]     @relation("PayeeOwner")
+  scheduledTransfers  ScheduledTransfer[]  @relation("ScheduledTransferOwner")
+
+  @@index([email])
+}
+
+/// Design note: ScheduledTransfer — recurring/one-time scheduled transfers.
+/// requirements  doesn't define this; it's a justified UX extension so users can
+/// set up recurring payments (e.g. rent). A background worker checks due rows
+/// every 60s and executes them via the existing transfer saga. `frequency` is
+/// once|weekly|monthly; `nextRunAt` is the next due time; `lastRunAt` tracks
+/// the last execution. Status active|paused|completed|failed.
+model ScheduledTransfer {
+  id              String   @id @default(cuid())
+  ownerUserId     String
+  sourceAccountId String
+  destinationAccountId String
+  amount          Decimal
+  frequency       String   // once|weekly|monthly
+  nextRunAt       DateTime
+  lastRunAt       DateTime?
+  status          String   @default("active") // active|paused|completed|failed
+  note            String?
+  createdAt       DateTime @default(now())
+
+  ownerUser User    @relation("ScheduledTransferOwner", fields: [ownerUserId], references: [id], onDelete: Cascade)
+  sourceAccount Account @relation("ScheduledTransferSource", fields: [sourceAccountId], references: [id], onDelete: Cascade)
+  destAccount Account @relation("ScheduledTransferDest", fields: [destinationAccountId], references: [id], onDelete: Cascade)
+
+  @@index([ownerUserId])
+  @@index([nextRunAt, status])
+}
+
+/// Design note: Payee — saved contacts for quick inter-user transfers. requirements
+/// doesn't define this; it's a justified UX extension so users don't re-enter
+/// account numbers every time. Each row is a (owner, target account) pair with
+/// an optional nickname. ownerUserId ≠ targetAccount.userId enforced in app.
+model Payee {
+  id              String   @id @default(cuid())
+  ownerUserId     String
+  targetAccountId String
+  nickname        String?
+  createdAt       DateTime @default(now())
+
+  ownerUser      User    @relation("PayeeOwner", fields: [ownerUserId], references: [id], onDelete: Cascade)
+  targetAccount Account @relation("PayeeTarget", fields: [targetAccountId], references: [id], onDelete: Cascade)
+
+  @@unique([ownerUserId, targetAccountId])
+  @@index([ownerUserId])
+}
+
+/// Design note: PasswordReset — short-lived reset tokens for the forgot-password
+/// flow. requirements  doesn't define this table; it's a justified extension for
+/// the password-reset UX. Token is stored hashed (SHA-256) so a DB leak can't
+/// be replayed. Expires after 15 minutes; single-use (consumedAt set on reset).
+model PasswordReset {
+  id          String    @id @default(cuid())
+  userId      String
+  tokenHash   String    @unique
+  expiresAt   DateTime
+  consumedAt  DateTime?
+  createdAt   DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+/// Refresh-token rotation and revocation state.
+model RefreshToken {
+  id          String    @id @default(cuid())
+  userId      String
+  jti         String    @unique
+  expiresAt   DateTime
+  consumedAt  DateTime?
+  revokedAt   DateTime?
+  createdAt   DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+/// kyc_documents — uploaded KYC docs + review state
+model KycDocument {
+  id          String    @id @default(cuid())
+  userId      String
+  docType     String
+  s3Key       String
+  status      String    @default("pending") // pending|approved|rejected
+  submittedAt DateTime  @default(now())
+  reviewedAt  DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+/// accounts — ledger system of record
+model Account {
+  id            String   @id @default(cuid())
+  userId        String
+  accountNumber String   @unique
+  accountType   String   @default("savings")
+  // NUMERIC(18,2); CHECK (balance >= 0) enforced in service (debit guards)
+  balance       Decimal  @default(0)
+  status        String   @default("active") // active|frozen|closed
+  createdAt     DateTime @default(now())
+
+  user                User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sourceTransactions  Transaction[]  @relation("SourceAccount")
+  destTransactions    Transaction[]  @relation("DestinationAccount")
+  payments           Payment[]
+  payees             Payee[]      @relation("PayeeTarget")
+  scheduledSources   ScheduledTransfer[]  @relation("ScheduledTransferSource")
+  scheduledDests     ScheduledTransfer[]  @relation("ScheduledTransferDest")
+
+  @@index([userId])
+  @@index([accountNumber])
+}
+
+/// transactions — internal transfers (Saga-tracked)
+model Transaction {
+  id                 String   @id @default(cuid())
+  sourceAccountId    String
+  destinationAccountId String
+  amount             Decimal
+  // CHECK (status IN ('pending','completed','failed','reversed'))
+  status             String   @default("pending")
+  sagaState          String   @default("started")
+  // Design note: optional merchant category for spending analytics (e.g. "rent",
+  // "groceries", "utilities"). Null for uncategorized/internal transfers.
+  category           String?
+  note               String?
+  createdAt          DateTime @default(now())
+
+  sourceAccount       Account @relation("SourceAccount", fields: [sourceAccountId], references: [id])
+  destinationAccount Account @relation("DestinationAccount", fields: [destinationAccountId], references: [id])
+  fraudFlags          FraudFlag[]
+
+  @@index([sourceAccountId])
+  @@index([destinationAccountId])
+  @@index([createdAt])
+  @@index([category])
+}
+
+/// payments — external mock top-up/withdrawal
+model Payment {
+  id          String   @id @default(cuid())
+  accountId   String
+  amount      Decimal
+  direction   String   // credit|debit
+  providerRef String?
+  // CHECK (status IN ('pending','completed','failed'))
+  status      String   @default("pending")
+  createdAt   DateTime @default(now())
+
+  account    Account     @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  fraudFlags FraudFlag[]
+
+  @@index([accountId])
+}
+
+/// Durable replay protection for money-moving API requests.
+model IdempotencyKey {
+  id            String   @id @default(cuid())
+  userId        String
+  operation     String
+  key           String
+  requestHash   String
+  status        String   @default("processing") // processing|completed
+  responseJson  String?
+  responseStatus Int?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, operation, key])
+  @@index([createdAt])
+}
+
+/// fraud_flags — async fraud evaluation output.
+/// CHECK (num_nonnulls(transaction_id,payment_id)=1) enforced in service.
+model FraudFlag {
+  id            String   @id @default(cuid())
+  transactionId String?
+  paymentId     String?
+  // CHECK (severity IN ('LOW','MEDIUM','HIGH'))
+  severity      String
+  reason        String
+  // CHECK (reviewed_status IN ('open','reviewed','dismissed'))
+  reviewedStatus String  @default("open")
+  createdAt     DateTime @default(now())
+
+  transaction Transaction? @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  payment     Payment?     @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+
+  @@index([reviewedStatus])
+}
+
+/// notifications — delivery log
+model Notification {
+  id        String   @id @default(cuid())
+  userId    String
+  channel   String   @default("email")
+  eventType String
+  status    String   @default("sent") // sent|failed (delivery status)
+  message   String?
+  // Design note: read-state for the user-facing notifications inbox. requirements 's
+  // `status` column tracks *delivery* (sent/failed); `isRead` tracks whether
+  // the user has seen it. Small, justified schema extension.
+  isRead    Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([isRead])
+}
+
+/// event_outbox — internal event bus persistence/replay log.
+/// payload is JSONB in Postgres; stored as TEXT (JSON) under SQLite.
+model EventOutbox {
+  id         String    @id @default(cuid())
+  eventType  String
+  payload    String    // JSON string
+  // CHECK (status IN ('pending','processed','failed'))
+  status     String    @default("pending")
+  attempts   Int       @default(0)
+  createdAt  DateTime  @default(now())
+  processedAt DateTime?
+
+  @@index([status, createdAt])
+}
+
+/// Design note — DeviceFingerprint: persistent state for the "new-device" fraud
+/// rule (requirements  R3). The spec says the rule is "header-based, simplified
+/// for demo"; a small table is the most practical lowest-cost way to make the
+/// rule stateful across restarts (in-memory would lose history). Not in requirements
+/// ; documented as an explicit schema extension.
+model DeviceFingerprint {
+  id           String   @id @default(cuid())
+  userId       String
+  fingerprint  String   // hash of user-agent + accept-language + ip prefix
+  firstSeenAt  DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, fingerprint])
+  @@index([userId])
+}

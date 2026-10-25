@@ -1,0 +1,81 @@
+# .github/workflows/ci-cd.yml — AegisBank CI/CD (Doc 3 Part G).
+#
+# Pipeline: push to main → run tests against ephemeral Postgres → on success,
+# build frontend and `cdk deploy` (which builds+pushes the backend Docker
+# image to ECR and updates the ECS Fargate service).
+#
+# Required GitHub secrets: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY (from the
+# aegisbank-deployer IAM user, Doc 3 Part D). NOT executed in the sandbox.
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: aegisbank_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://postgres:test@localhost:5432/aegisbank_test
+      JWT_ACCESS_SECRET: ci-access-secret-32-bytes-minimum-ok
+      JWT_REFRESH_SECRET: ci-refresh-secret-32-bytes-minimum-ok
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - name: Install backend deps
+        run: cd backend && npm ci
+      - name: Wait for Postgres
+        run: npx wait-on tcp:localhost:5432 -t 30000
+      - name: Run migrations
+        run: cd backend && npx prisma migrate deploy
+      - name: Run tests
+        run: cd backend && npm test -- --ci --reporters=default
+
+  deploy:
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-south-1
+      - name: Build frontend
+        run: cd frontend && npm ci && npm run build
+      - name: Deploy infra
+        run: |
+          cd infrastructure/cdk
+          npm ci
+          npx cdk deploy --require-approval never
+      - name: Run migrations against RDS via ECS exec
+        run: |
+          aws ecs execute-command --cluster AegisCluster --task $TASK_ID \
+            --container AegisApi --interactive --command "npx prisma migrate deploy"
+        env:
+          TASK_ID: ${{ steps.task_id.outputs.id }}
